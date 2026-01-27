@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: rtmp-opencv-relay
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - name: Nishanth Kottapalli
+license: Apache-2.0
+keywords:
+  - rtmp
+  - ffmpeg
+  - opencv
+  - streaming
+  - video
+repository-code: https://github.com/nishanthkottapalli/rtmp-opencv-relay
+url: https://github.com/nishanthkottapalli/rtmp-opencv-relay
+version: 0.1.0
