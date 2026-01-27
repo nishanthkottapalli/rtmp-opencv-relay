@@ -1,0 +1,36 @@
+[project]
+name = "rtmp-opencv-relay"
+version = "0.1.0"
+description = "Headless RTMP → OpenCV frame processing → RTMP relay using FFmpeg pipes."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Nishanth Kottapalli" }
+]
+keywords = ["rtmp", "ffmpeg", "opencv", "streaming", "video", "relay", "headless"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Software Development :: Libraries"
+]
+dependencies = [
+  "numpy",
+  "opencv-python-headless"
+]
+
+[project.urls]
+Homepage = "https://github.com/nishanthkottapalli/rtmp-opencv-relay"
+Repository = "https://github.com/nishanthkottapalli/rtmp-opencv-relay"
+Issues = "https://github.com/nishanthkottapalli/rtmp-opencv-relay/issues"
+
+[tool.setuptools]
+py-modules = ["rtmp_relay"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
