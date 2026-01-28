@@ -63,15 +63,117 @@ def _epoch_ms() -> int:
     return int(time.time() * 1000)
 
 
+# --------------------
+# 7-seg overlay helpers
+# --------------------
+# Segment order: a b c d e f g
+# a: top, b: upper-right, c: lower-right, d: bottom, e: lower-left, f: upper-left, g: middle
+_DIGIT_SEGMENTS = {
+    0: (1, 1, 1, 1, 1, 1, 0),
+    1: (0, 1, 1, 0, 0, 0, 0),
+    2: (1, 1, 0, 1, 1, 0, 1),
+    3: (1, 1, 1, 1, 0, 0, 1),
+    4: (0, 1, 1, 0, 0, 1, 1),
+    5: (1, 0, 1, 1, 0, 1, 1),
+    6: (1, 0, 1, 1, 1, 1, 1),
+    7: (1, 1, 1, 0, 0, 0, 0),
+    8: (1, 1, 1, 1, 1, 1, 1),
+    9: (1, 1, 1, 1, 0, 1, 1),
+}
+
+
+def _draw_rect(img: np.ndarray, x: int, y: int, w: int, h: int, color=(255, 255, 255)):
+    cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), color, thickness=-1)
+
+
+def _draw_7seg_digit(
+    img: np.ndarray,
+    digit: int,
+    x: int,
+    y: int,
+    seg_len: int,
+    seg_th: int,
+    gap: int,
+    color=(255, 255, 255),
+):
+    """
+    Draw one digit inside a fixed bounding box:
+      width  = seg_len + 2*seg_th
+      height = 2*seg_len + 3*seg_th
+    with a small gap between segments (gap).
+    """
+    d = int(digit) % 10
+    a, b, c, dseg, e, f, g = _DIGIT_SEGMENTS[d]
+
+    # coords helpers
+    w = seg_len + 2 * seg_th
+    h = 2 * seg_len + 3 * seg_th
+
+    # segment rectangles
+    # a (top)
+    if a:
+        _draw_rect(img, x + seg_th, y, seg_len, seg_th, color)
+    # g (middle)
+    if g:
+        _draw_rect(img, x + seg_th, y + seg_len + seg_th, seg_len, seg_th, color)
+    # d (bottom)
+    if dseg:
+        _draw_rect(img, x + seg_th, y + 2 * seg_len + 2 * seg_th, seg_len, seg_th, color)
+
+    # f (upper-left)
+    if f:
+        _draw_rect(img, x, y + seg_th, seg_th, seg_len, color)
+    # b (upper-right)
+    if b:
+        _draw_rect(img, x + seg_th + seg_len, y + seg_th, seg_th, seg_len, color)
+
+    # e (lower-left)
+    if e:
+        _draw_rect(img, x, y + 2 * seg_th + seg_len, seg_th, seg_len, color)
+    # c (lower-right)
+    if c:
+        _draw_rect(img, x + seg_th + seg_len, y + 2 * seg_th + seg_len, seg_th, seg_len, color)
+
+    return w, h
+
+
+def _draw_7seg_number(
+    img: np.ndarray,
+    number_str: str,
+    x: int,
+    y: int,
+    seg_len: int,
+    seg_th: int,
+    digit_spacing: int,
+    color=(255, 255, 255),
+):
+    """
+    Draw a sequence of digits. Returns (total_w, digit_w, digit_h).
+    """
+    digit_w = seg_len + 2 * seg_th
+    digit_h = 2 * seg_len + 3 * seg_th
+
+    cursor = x
+    for ch in number_str:
+        if ch < "0" or ch > "9":
+            continue
+        _draw_7seg_digit(img, int(ch), cursor, y, seg_len, seg_th, gap=0, color=color)
+        cursor += digit_w + digit_spacing
+
+    total_w = cursor - x - digit_spacing if number_str else 0
+    return total_w, digit_w, digit_h
+
+
 class Ingestor:
     """
     Ingestor: rtmp://domain/app/streamkey -> raw bgr24 frames via stdout pipe.
 
-    IMPORTANT: Enforces scale to (width,height) so the read size always matches.
+    Enforces scale to (width,height) so read size is stable.
+
     Optional overlays:
-      - watermark_text: arbitrary
-      - timecode_overlay: machine-parseable stamp for deterministic latency
-        format: "TC|ms=<epoch_ms>|seq=<seq>"
+      - watermark_text
+      - timecode_7seg_overlay: draws epoch_ms as 13 digits in a fixed ROI.
+        This is meant for deterministic latency measurement without OCR.
     """
 
     def __init__(
@@ -84,12 +186,14 @@ class Ingestor:
         loglevel="info",
         watermark_text="",
         scale_algo="bilinear",
-        timecode_overlay: bool = False,
-        timecode_position: str = "bl",  # "bl" bottom-left, "tl" top-left
-        timecode_prefix: str = "TC",
-        timecode_font_scale: float = 0.55,
-        timecode_thickness: int = 2,
+        timecode_7seg_overlay: bool = False,
+        timecode_position: str = "bl",   # "bl" bottom-left or "tl" top-left
+        timecode_seg_len: int = 18,      # tune for readability after encode
+        timecode_seg_th: int = 4,
+        timecode_digit_spacing: int = 6,
         timecode_margin_px: int = 10,
+        timecode_bg: bool = True,
+        timecode_bg_padding: int = 8,
     ):
         self.source = source
         self.streamkey = streamkey
@@ -100,12 +204,14 @@ class Ingestor:
         self.watermark_text = watermark_text
         self.scale_algo = scale_algo
 
-        self.timecode_overlay = bool(timecode_overlay)
+        self.timecode_7seg_overlay = bool(timecode_7seg_overlay)
         self.timecode_position = timecode_position
-        self.timecode_prefix = timecode_prefix
-        self.timecode_font_scale = float(timecode_font_scale)
-        self.timecode_thickness = int(timecode_thickness)
+        self.timecode_seg_len = int(timecode_seg_len)
+        self.timecode_seg_th = int(timecode_seg_th)
+        self.timecode_digit_spacing = int(timecode_digit_spacing)
         self.timecode_margin_px = int(timecode_margin_px)
+        self.timecode_bg = bool(timecode_bg)
+        self.timecode_bg_padding = int(timecode_bg_padding)
 
         self._address = self.source + self.streamkey
         self.frame_size = self.width * self.height * 3
@@ -153,9 +259,6 @@ class Ingestor:
         self.last_frame_readat = 0.0
         self.rfps = 0.0
         self.first_readat = 0.0
-
-        # timecode sequence counter
-        self._seq = 0
 
     def initialize(self):
         self.start_time = time.time()
@@ -212,53 +315,48 @@ class Ingestor:
         )
         return True
 
-    def _put_text_with_bg(
-        self,
-        img: np.ndarray,
-        text: str,
-        org: Tuple[int, int],
-        font=cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale: float = 0.55,
-        thickness: int = 2,
-        margin: int = 4,
-    ):
+    def _overlay_timecode_7seg(self, vframe: np.ndarray):
         """
-        Draw text with a solid background rectangle to make OCR much more reliable.
+        Draw epoch_ms as 13-digit 7-seg number in a fixed ROI.
         """
-        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-        x, y = org
-        # background rectangle coordinates
-        x1 = max(0, x - margin)
-        y1 = max(0, y - th - margin)
-        x2 = min(img.shape[1], x + tw + margin)
-        y2 = min(img.shape[0], y + baseline + margin)
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 0), -1)  # black bg
-        cv2.putText(img, text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        ms = _epoch_ms()
+        s = f"{ms:013d}"  # stable width
 
-    def _overlay_timecode(self, vframe: np.ndarray):
-        """
-        Overlay parse-friendly timecode.
-        Example: TC|ms=1700000000123|seq=42
-        """
-        self._seq += 1
-        stamp = f"{self.timecode_prefix}|ms={_epoch_ms()}|seq={self._seq}"
-
+        seg_len = self.timecode_seg_len
+        seg_th = self.timecode_seg_th
+        spacing = self.timecode_digit_spacing
         margin = self.timecode_margin_px
-        if self.timecode_position == "tl":
-            # OpenCV text origin is baseline-left; so y must be > text height
-            x = margin
-            y = margin + 20
-        else:
-            # bottom-left
-            x = margin
-            y = self.height - margin
 
-        self._put_text_with_bg(
+        digit_w = seg_len + 2 * seg_th
+        digit_h = 2 * seg_len + 3 * seg_th
+        total_w = 13 * digit_w + 12 * spacing
+        total_h = digit_h
+
+        if self.timecode_position == "tl":
+            x = margin
+            y = margin
+        else:
+            x = margin
+            y = self.height - margin - total_h
+
+        # background to survive compression
+        if self.timecode_bg:
+            pad = self.timecode_bg_padding
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(self.width, x + total_w + pad)
+            y2 = min(self.height, y + total_h + pad)
+            cv2.rectangle(vframe, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
+
+        _draw_7seg_number(
             vframe,
-            stamp,
-            (x, y),
-            font_scale=self.timecode_font_scale,
-            thickness=self.timecode_thickness,
+            s,
+            x=x,
+            y=y,
+            seg_len=seg_len,
+            seg_th=seg_th,
+            digit_spacing=spacing,
+            color=(255, 255, 255),
         )
 
     def read(self):
@@ -273,7 +371,6 @@ class Ingestor:
             (self.height, self.width, 3)
         )
 
-        # watermark (optional)
         if self.watermark_text:
             cv2.putText(
                 vframe,
@@ -286,9 +383,8 @@ class Ingestor:
                 cv2.LINE_AA,
             )
 
-        # timecode overlay (optional)
-        if self.timecode_overlay:
-            self._overlay_timecode(vframe)
+        if self.timecode_7seg_overlay:
+            self._overlay_timecode_7seg(vframe)
 
         elapsed_last_read = max(1e-6, now - self.last_frame_readat)
         rps = 1.0 / elapsed_last_read
