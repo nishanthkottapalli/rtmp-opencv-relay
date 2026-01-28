@@ -190,7 +190,13 @@ python examples/run_relay.py \
   --out-key  "streamkey" \
   --width 1280 --height 720 \
   --audiodelay 2.0 \
-  --loglevel info
+  --loglevel info \
+  --timecode
+
+```
+For tuning, use:
+```
+--timecode-seg-len 22 --timecode-seg-th 5 --timecode-spacing 6 --timecode-margin 10
 ```
 
 ---
