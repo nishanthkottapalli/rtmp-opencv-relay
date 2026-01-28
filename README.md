@@ -219,5 +219,5 @@ If the relay and analysis run on different machines with clock skew, the compute
 ## TO-DO
 
 * [ ] `Dockerfile` + `docker-compose.yml` for a clean "runs anywhere" deployment (ffmpeg + Python + headless OpenCV).
-* [ ] Add a “health” CLI to validate ffmpeg/ffprobe availability and RTMP URL connectivity.
+* [ ] Add a "health" CLI to validate ffmpeg/ffprobe availability and RTMP URL connectivity.
 * [ ] Add CI smoke checks + basic unit tests for 7-seg decode and ffprobe parsing.
