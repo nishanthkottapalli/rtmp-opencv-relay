@@ -29,9 +29,7 @@ ffmpeg_logger = logging.getLogger("ffmpeg")
 ffmpeg_logger.setLevel(logging.INFO)
 
 if not ffmpeg_logger.handlers:
-    ffmpeg_formatter = logging.Formatter(
-        "%(asctime)s:%(levelname)s:%(name)s:%(message)s"
-    )
+    ffmpeg_formatter = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s:%(message)s")
     ffmpeg_handler = trfh("logs/ffmpeg.log", when="m", interval=1, backupCount=10)
     ffmpeg_handler.setFormatter(ffmpeg_formatter)
     ffmpeg_logger.addHandler(ffmpeg_handler)
@@ -41,16 +39,23 @@ def _start_ffmpeg_stderr_logger(proc, logger, prefix: str):
     """
     Drain ffmpeg stderr in a background thread so the process cannot block
     when stderr pipe buffers fill.
+
+    NOTE: stderr is read as bytes (since we don't use text=True).
     """
     if proc is None or proc.stderr is None:
         return None
 
     def _run():
         try:
-            for line in iter(proc.stderr.readline, ""):
+            while True:
+                line = proc.stderr.readline()
                 if not line:
                     break
-                logger.info("%s %s", prefix, line.rstrip())
+                try:
+                    s = line.decode("utf-8", errors="replace").rstrip()
+                except Exception:
+                    s = repr(line)
+                logger.info("%s %s", prefix, s)
         except Exception as e:
             logger.exception("%s stderr logger crashed: %s", prefix, e)
 
@@ -100,16 +105,10 @@ def _draw_7seg_digit(
     Draw one digit inside a fixed bounding box:
       width  = seg_len + 2*seg_th
       height = 2*seg_len + 3*seg_th
-    with a small gap between segments (gap).
     """
     d = int(digit) % 10
     a, b, c, dseg, e, f, g = _DIGIT_SEGMENTS[d]
 
-    # coords helpers
-    w = seg_len + 2 * seg_th
-    h = 2 * seg_len + 3 * seg_th
-
-    # segment rectangles
     # a (top)
     if a:
         _draw_rect(img, x + seg_th, y, seg_len, seg_th, color)
@@ -134,6 +133,8 @@ def _draw_7seg_digit(
     if c:
         _draw_rect(img, x + seg_th + seg_len, y + 2 * seg_th + seg_len, seg_th, seg_len, color)
 
+    w = seg_len + 2 * seg_th
+    h = 2 * seg_len + 3 * seg_th
     return w, h
 
 
@@ -147,9 +148,6 @@ def _draw_7seg_number(
     digit_spacing: int,
     color=(255, 255, 255),
 ):
-    """
-    Draw a sequence of digits. Returns (total_w, digit_w, digit_h).
-    """
     digit_w = seg_len + 2 * seg_th
     digit_h = 2 * seg_len + 3 * seg_th
 
@@ -173,7 +171,6 @@ class Ingestor:
     Optional overlays:
       - watermark_text
       - timecode_7seg_overlay: draws epoch_ms as 13 digits in a fixed ROI.
-        This is meant for deterministic latency measurement without OCR.
     """
 
     def __init__(
@@ -187,8 +184,8 @@ class Ingestor:
         watermark_text="",
         scale_algo="bilinear",
         timecode_7seg_overlay: bool = False,
-        timecode_position: str = "bl",   # "bl" bottom-left or "tl" top-left
-        timecode_seg_len: int = 18,      # tune for readability after encode
+        timecode_position: str = "bl",  # "bl" bottom-left or "tl" top-left
+        timecode_seg_len: int = 18,
         timecode_seg_th: int = 4,
         timecode_digit_spacing: int = 6,
         timecode_margin_px: int = 10,
@@ -265,10 +262,9 @@ class Ingestor:
         ingestor_logger.info("STARTED_AT=%s", str(datetime.datetime.now()))
         self._vpipe = sp.Popen(
             self._cmdx,
-            stdout=sp.PIPE,
-            stderr=sp.PIPE,
-            bufsize=1,
-            text=True,
+            stdout=sp.PIPE,  # bytes
+            stderr=sp.PIPE,  # bytes
+            bufsize=0,
         )
         self._stderr_thread = _start_ffmpeg_stderr_logger(
             self._vpipe, ffmpeg_logger, "[ffmpeg-ingest]"
@@ -316,9 +312,6 @@ class Ingestor:
         return True
 
     def _overlay_timecode_7seg(self, vframe: np.ndarray):
-        """
-        Draw epoch_ms as 13-digit 7-seg number in a fixed ROI.
-        """
         ms = _epoch_ms()
         s = f"{ms:013d}"  # stable width
 
@@ -339,7 +332,6 @@ class Ingestor:
             x = margin
             y = self.height - margin - total_h
 
-        # background to survive compression
         if self.timecode_bg:
             pad = self.timecode_bg_padding
             x1 = max(0, x - pad)
@@ -539,10 +531,9 @@ class Broadcastor:
     def initialize(self):
         self._vpipe = sp.Popen(
             self.cmdx,
-            stdin=sp.PIPE,
-            stderr=sp.PIPE,
-            bufsize=1,
-            text=True,
+            stdin=sp.PIPE,   # bytes
+            stderr=sp.PIPE,  # bytes
+            bufsize=0,
         )
         self._stderr_thread = _start_ffmpeg_stderr_logger(
             self._vpipe, ffmpeg_logger, "[ffmpeg-broadcast]"
