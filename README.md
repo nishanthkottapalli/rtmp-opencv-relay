@@ -5,16 +5,17 @@
 
 Headless RTMP video relay:
 
-> RTMP input → OpenCV processing → RTMP output (FFmpeg pipes)
+> RTMP input → OpenCV frame processing → RTMP output (FFmpeg pipes)
 
-**RTMP input → ffmpeg rawvideo pipe → NumPy/OpenCV frame processing → ffmpeg RTMP output**
+**RTMP input → ffmpeg rawvideo pipe → NumPy/OpenCV processing → ffmpeg RTMP output**
 
 Includes:
 - headless operation (no GUI / no `cv2.waitKey`)
-- ffmpeg `stderr` draining in a background thread (prevents pipe blocking)
+- ffmpeg `stderr` draining in a background thread (prevents process blocking)
 - rotating logs in `./logs/`
-- optional **7-segment timecode overlay** for deterministic latency measurement (**no tesseract / no OCR**)
-- `examples/video_analysis.py` to compare input/output stream quality + relay/broadcaster stats + timecode-based latency
+- optional watermark overlay
+- optional **deterministic 7-segment timecode overlay** (epoch_ms) for latency measurement (**no tesseract / no OCR**)
+- `examples/video_analysis.py` for **input vs output** stream analysis + **broadcaster stats** + **timecode latency** reporting
 
 ---
 
@@ -22,7 +23,7 @@ Includes:
 
 - Python 3.9+
 - `ffmpeg` available in PATH (or provide `--ffmpeg /path/to/ffmpeg`)
-- `ffprobe` available in PATH (usually comes with ffmpeg) for stream metadata in analysis
+- `ffprobe` available in PATH (usually installed with ffmpeg) for `examples/video_analysis.py`
 
 ---
 
@@ -30,7 +31,7 @@ Includes:
 
 This repo uses a **src/** layout.
 
-### Option A: editable install (recommended for development)
+### Option A: editable install (recommended)
 
 ```bash
 pip install -e .
@@ -42,11 +43,6 @@ pip install -e .
 pip install .
 ```
 
-Dependencies are:
-
-* `numpy`
-* `opencv-python-headless`
-
 ---
 
 ## Repo layout
@@ -55,19 +51,22 @@ Dependencies are:
 .
 ├── src/
 │   └── rtmp_opencv/
+│       ├── __init__.py
 │       └── relay.py              # Ingestor + Broadcastor (FFmpeg pipes)
 ├── examples/
-│   ├── run_relay.py              # main relay runner (headless)
-│   └── video_analysis.py         # stream analysis + deterministic latency
-└── logs/
-    ├── process.log
-    ├── ingestor.log
-    └── ffmpeg.log
+│   ├── run_relay.py              # headless relay runner (CLI)
+│   └── video_analysis.py         # stream analysis + broadcaster stats + latency
+├── logs/
+│   └── .keep
+├── LICENSE
+├── NOTICE
+├── pyproject.toml
+└── README.md
 ```
 
 ---
 
-## Usage: Run the relay
+## Usage: run the relay
 
 Use `examples/run_relay.py`:
 
@@ -86,11 +85,47 @@ python examples/run_relay.py \
 
 By default, audio is taken from the full input URL (`--in-base + --in-key`).
 
-Override with:
+Override it with:
 
 ```bash
 --audio-url "rtmp://sourcedomain.com/appname/streamkey"
 ```
+
+### Watermark
+
+```bash
+--watermark "Copyright 2026, Your Company."
+```
+
+### Deterministic timecode overlay (no OCR)
+
+Enable a **7-segment epoch_ms overlay** on the output video frames:
+
+```bash
+python examples/run_relay.py \
+  --in-base  "rtmp://sourcedomain.com/appname/" \
+  --in-key   "streamkey" \
+  --out-base "rtmp://destinationdomain.com/appname/" \
+  --out-key  "streamkey" \
+  --width 1280 --height 720 \
+  --loglevel info \
+  --timecode
+```
+
+Tuning knobs if you need a more readable overlay (recommended if the stream is heavily compressed):
+
+```bash
+--timecode-seg-len 22 \
+--timecode-seg-th  5  \
+--timecode-spacing 6  \
+--timecode-margin  10 \
+--timecode-position bl
+```
+
+Notes:
+
+* The overlay is designed to be decoded by pixel sampling (not OCR).
+* It is drawn in **white segments** on a **black background** for better survivability through H.264 compression.
 
 ---
 
@@ -99,32 +134,36 @@ Override with:
 Rotating logs live under `./logs/`:
 
 * `logs/process.log` – main loop status (runner script)
-* `logs/ingestor.log` – frame ingest/read counters (FPS/RPS)
-* `logs/ffmpeg.log` – ffmpeg ingest + broadcast logs (stderr drained in a background thread)
+* `logs/ingestor.log` – ingest/read counters (FPS/RPS)
+* `logs/ffmpeg.log` – ffmpeg ingest + broadcast stderr logs (drained in a background thread)
 
 ---
 
-## Video encoding notes
-
-* Output video encoded using `libx264` with `ultrafast` + `zerolatency`.
-* Audio mapping is optional (`1:a:0?`) so the relay still runs if the input has no audio.
-* Watermark text can be changed via `--watermark`.
-
----
-
-## Stream analysis + deterministic latency (no OCR)
+## Stream analysis + latency reporting
 
 `examples/video_analysis.py` provides:
 
 1. **Stream metadata** via `ffprobe` (input + output)
-2. **Quality comparison** between input/output frames (MAE, PSNR, histogram distance, brightness/contrast)
-3. **Broadcaster/relay stats** when run in controlled mode
-4. **Deterministic latency** using a **7-segment timecode overlay** decoded from output frames
-   (no tesseract, no OCR)
+2. **Quality comparison** of sampled input/output frames:
 
-### Recommended workflow
+   * MAE, PSNR (grayscale), histogram distance, brightness/contrast
+   * saves sample artifacts: `in_*.png`, `out_*.png`, `diff_*.png`
+3. **Broadcaster analysis** (when running in controlled test mode)
+4. **Deterministic latency measurement** by decoding the 7-segment overlay from output frames (**no OCR**)
 
-#### A) Run a controlled relay test (injects 7-seg epoch_ms overlay) + decode latency
+### A) Analyze live streams (quality only)
+
+```bash
+python examples/video_analysis.py \
+  --in-url  "rtmp://sourcedomain.com/appname/streamkey" \
+  --out-url "rtmp://destinationdomain.com/appname/streamkey" \
+  --width 640 --height 360 \
+  --sample-seconds 10 --sample-fps 10
+```
+
+### B) Controlled relay test (inject timecode + measure latency)
+
+This runs a short relay with **7-segment overlay ON**, then samples output frames and computes latency stats:
 
 ```bash
 python examples/video_analysis.py \
@@ -136,17 +175,7 @@ python examples/video_analysis.py \
   --sample-seconds 12 --sample-fps 10
 ```
 
-This will:
-
-* run a relay for `--test-duration` seconds **with 7-seg overlay ON**
-* sample frames from both input/output
-* decode 13-digit epoch_ms from output overlay
-* report latency stats (`mean`, `p50`, `p95`, etc.)
-* write artifacts + `report.json` under `artifacts/video_analysis/<timestamp>/`
-
-#### B) If timecode parsing is unstable
-
-Increase overlay legibility (bigger segments):
+Optional tuning if the decoder fails to parse timecodes reliably:
 
 ```bash
 python examples/video_analysis.py \
@@ -155,13 +184,14 @@ python examples/video_analysis.py \
   --test-relay --test-duration 10 \
   --expect-7seg-timecode \
   --timecode-seg-len 22 \
-  --timecode-seg-th 5 \
+  --timecode-seg-th  5  \
+  --timecode-spacing 6  \
   --video-bitrate 4M
 ```
 
-### About the latency number
+### What the latency means
 
-The deterministic latency uses:
+Latency is computed as:
 
 > `latency_ms = now_epoch_ms - embedded_epoch_ms`
 
@@ -171,38 +201,23 @@ So it includes:
 * encoder/decoder latency
 * any RTMP server/CDN buffering
 
-If your relay and analysis run on different hosts with clock skew, the latency will include that offset. For best results:
+If the relay and analysis run on different machines with clock skew, the computed latency will include that offset. For best results:
 
-* run analysis on the same host as the relay, or
-* ensure stable NTP on both.
+* run analysis on the same machine as the relay, or
+* ensure stable NTP on both machines.
 
 ---
 
-## Quick start
+## Encoding notes
 
-```bash
-pip install -e .
-
-python examples/run_relay.py \
-  --in-base  "rtmp://sourcedomain.com/appname/" \
-  --in-key   "streamkey" \
-  --out-base "rtmp://destinationdomain.com/appname/" \
-  --out-key  "streamkey" \
-  --width 1280 --height 720 \
-  --audiodelay 2.0 \
-  --loglevel info \
-  --timecode
-
-```
-For tuning, use:
-```
---timecode-seg-len 22 --timecode-seg-th 5 --timecode-spacing 6 --timecode-margin 10
-```
+* Output video is encoded using `libx264` with `ultrafast` + `zerolatency`.
+* Audio is mapped as optional (`1:a:0?`) so the relay continues even if input audio is missing.
+* The ingestor forces scaling to `--width/--height` to keep raw frame size stable.
 
 ---
 
 ## TO-DO
 
-* [ ] Add optional monotonic timecode mode + offset calibration (for multi-host analysis).
-* [ ] Add “health” CLI that checks ffmpeg/ffprobe availability and validates stream URLs.
 * [ ] `Dockerfile` + `docker-compose.yml` for a clean "runs anywhere" deployment (ffmpeg + Python + headless OpenCV).
+* [ ] Add a “health” CLI to validate ffmpeg/ffprobe availability and RTMP URL connectivity.
+* [ ] Add CI smoke checks + basic unit tests for 7-seg decode and ffprobe parsing.
