@@ -23,18 +23,15 @@ dependencies = [
   "opencv-python-headless"
 ]
 
+[project.optional-dependencies]
+analysis = [
+  "pytesseract"
+]
+
 [project.urls]
 Homepage = "https://github.com/nishanthkottapalli/rtmp-opencv-relay"
 Repository = "https://github.com/nishanthkottapalli/rtmp-opencv-relay"
 Issues = "https://github.com/nishanthkottapalli/rtmp-opencv-relay/issues"
-
-# Optional: convenient CLI entrypoints (keeps examples/ runnable too)
-# If you add these, you’ll need tiny wrappers in src/rtmp_opencv/cli_*.py (tell me and I’ll provide them),
-# OR remove this section and just run python examples/*.py
-#
-# [project.scripts]
-# rtmp-relay = "rtmp_opencv.cli_relay:main"
-# rtmp-video-analysis = "rtmp_opencv.cli_video_analysis:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -42,4 +39,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["rtmp_opencv*"]
