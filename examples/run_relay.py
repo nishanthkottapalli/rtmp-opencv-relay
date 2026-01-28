@@ -2,7 +2,7 @@ import os
 import logging
 import argparse
 
-import rtmp_relay as relay
+from rtmp_opencv.relay import Ingestor, Broadcastor
 
 os.makedirs("logs", exist_ok=True)
 
@@ -41,7 +41,7 @@ def main():
     logger.info("Starting relay")
     logger.info("IN=%s OUT=%s AUDIO=%s %sx%s", in_url, out_url, audio_url, args.width, args.height)
 
-    ingestor = relay.Ingestor(
+    ingestor = Ingestor(
         args.in_base,
         args.in_key,
         args.width,
@@ -51,7 +51,7 @@ def main():
         watermark_text=args.watermark,
     ).initialize()
 
-    broadcastor = relay.Broadcastor(
+    broadcastor = Broadcastor(
         args.out_base,
         args.out_key,
         args.width,
