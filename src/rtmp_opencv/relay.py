@@ -63,11 +63,8 @@ class Ingestor:
     """
     Ingestor: rtmp://domain/app/streamkey -> raw bgr24 frames via stdout pipe.
 
-    Usage:
-        ing = Ingestor(...).initialize()
-        while ing.grab():
-            frame = ing.read()
-            ...
+    IMPORTANT: This ingestor enforces scale to (width,height) so the read size
+    always matches width*height*3.
     """
 
     def __init__(
@@ -78,7 +75,8 @@ class Ingestor:
         height,
         ffmpeg_bin="ffmpeg",
         loglevel="info",
-        watermark_text="Copyright YYYY, Company Name Goes Here.",
+        watermark_text="",
+        scale_algo="bilinear",
     ):
         self.source = source
         self.streamkey = streamkey
@@ -87,9 +85,14 @@ class Ingestor:
         self.bin = ffmpeg_bin
         self.loglevel = loglevel
         self.watermark_text = watermark_text
+        self.scale_algo = scale_algo
 
         self._address = self.source + self.streamkey
         self.frame_size = self.width * self.height * 3
+
+        # Enforce output size so our frame reads are stable.
+        # Using scale=WxH:flags=... and fps passthrough (no fps filter here).
+        vf = f"scale={self.width}:{self.height}:flags={self.scale_algo}"
 
         self._cmdx = [
             self.bin,
@@ -106,6 +109,8 @@ class Ingestor:
             "-i",
             self._address,
             "-an",
+            "-vf",
+            vf,
             "-pix_fmt",
             "bgr24",
             "-f",
@@ -137,7 +142,7 @@ class Ingestor:
         self._vpipe = sp.Popen(
             self._cmdx,
             stdout=sp.PIPE,  # binary rawvideo
-            stderr=sp.PIPE,  # text stderr (text=True)
+            stderr=sp.PIPE,  # text stderr
             bufsize=1,
             text=True,
         )
@@ -167,6 +172,11 @@ class Ingestor:
             self._grabbed = False
             return False
 
+        # detect early exit
+        if self._vpipe.poll() is not None:
+            self._grabbed = False
+            return False
+
         raw = self._read_exact(self.frame_size)
         if len(raw) != self.frame_size:
             self._grabbed = False
@@ -179,7 +189,10 @@ class Ingestor:
         total_time = max(1e-6, time.time() - self.start_time)
         self.fps = self.total_frames / total_time
         ingestor_logger.info(
-            "FPS=%s FRAMES=%s ELAPSED=%s", str(self.fps), str(self.total_frames), str(total_time)
+            "FPS=%s FRAMES=%s ELAPSED=%s",
+            str(self.fps),
+            str(self.total_frames),
+            str(total_time),
         )
         return True
 
@@ -297,7 +310,6 @@ class Broadcastor:
         self._stderr_thread = None
         self.stopped = False
 
-        # Build ffmpeg command
         self.cmdx = [
             self.bin,
             "-loglevel",
@@ -305,7 +317,6 @@ class Broadcastor:
             "-y",
             "-thread_queue_size",
             "4096",
-            # rawvideo from stdin
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -314,17 +325,14 @@ class Broadcastor:
             self.videosize,
             "-i",
             "-",
-            # audio from source url with delay
             "-itsoffset",
             str(self.audiodelay),
             "-i",
             self.sourceurl,
-            # mapping
             "-map",
             "0:v:0",
             "-map",
             "1:a:0?",
-            # video encoding
             "-c:v",
             "libx264",
             "-preset",
@@ -360,6 +368,12 @@ class Broadcastor:
             self.address,
         ]
 
+        # counters for analysis / introspection
+        self.frames_pushed = 0
+        self.write_failures = 0
+        self.first_push_at = None
+        self.last_push_at = None
+
     def initialize(self):
         self._vpipe = sp.Popen(
             self.cmdx,
@@ -377,22 +391,40 @@ class Broadcastor:
         self.write(sframe)
         return self
 
+    def is_alive(self) -> bool:
+        return self._vpipe is not None and self._vpipe.poll() is None
+
     def write(self, frame) -> bool:
         if self.stopped or self._vpipe is None or self._vpipe.stdin is None:
+            self.write_failures += 1
             return False
 
         if frame is None or frame.size == 0:
+            self.write_failures += 1
             return False
 
         try:
             self._vpipe.stdin.write(frame.tobytes())
+            now = time.time()
+            self.frames_pushed += 1
+            if self.first_push_at is None:
+                self.first_push_at = now
+            self.last_push_at = now
             return True
         except BrokenPipeError:
+            self.write_failures += 1
             self.stop()
             return False
         except Exception:
+            self.write_failures += 1
             self.stop()
             return False
+
+    def pushed_fps(self) -> float:
+        if self.first_push_at is None or self.last_push_at is None:
+            return 0.0
+        dt = max(1e-6, self.last_push_at - self.first_push_at)
+        return float(self.frames_pushed / dt)
 
     def stop(self):
         self.stopped = True
