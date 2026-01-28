@@ -10,11 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from rtmp_opencv.relay import Ingestor, Broadcastor
+
 
 # -----------------------------
-# Utilities: ffprobe
+# ffprobe
 # -----------------------------
-def _run(cmd: List[str], timeout: int = 15) -> Tuple[int, str, str]:
+def _run(cmd: List[str], timeout: int = 20) -> Tuple[int, str, str]:
     p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, text=True)
     try:
         out, err = p.communicate(timeout=timeout)
@@ -25,10 +27,21 @@ def _run(cmd: List[str], timeout: int = 15) -> Tuple[int, str, str]:
     return p.returncode, out, err
 
 
+def _safe_int(x) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
 def ffprobe_summary(url: str) -> Dict[str, Any]:
-    """
-    Return a compact summary of video+audio streams via ffprobe.
-    """
     cmd = [
         "ffprobe",
         "-v", "error",
@@ -53,7 +66,6 @@ def ffprobe_summary(url: str) -> Dict[str, Any]:
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
     def _fps(s):
-        # try avg_frame_rate, fallback r_frame_rate
         for k in ("avg_frame_rate", "r_frame_rate"):
             v = (s or {}).get(k)
             if isinstance(v, str) and "/" in v:
@@ -100,22 +112,8 @@ def ffprobe_summary(url: str) -> Dict[str, Any]:
     return summary
 
 
-def _safe_int(x) -> Optional[int]:
-    try:
-        return int(x)
-    except Exception:
-        return None
-
-
-def _safe_float(x) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
 # -----------------------------
-# Frame sampling
+# Sampling config
 # -----------------------------
 @dataclass
 class SampleConfig:
@@ -125,89 +123,64 @@ class SampleConfig:
     sample_fps: float
     warmup_seconds: float
     loglevel: str
+    ffmpeg_bin: str
+    watermark_text: str
 
 
-def _ffmpeg_raw_bgr_reader(url: str, cfg: SampleConfig) -> sp.Popen:
+def split_rtmp_url(url: str) -> Tuple[str, str]:
+    if "/" not in url:
+        raise ValueError(f"Invalid RTMP URL: {url}")
+    base, key = url.rsplit("/", 1)
+    return base + "/", key
+
+
+def sample_frames(url: str, cfg: SampleConfig) -> Tuple[List[np.ndarray], List[float]]:
     """
-    Start ffmpeg to read an RTMP URL and output raw BGR frames at a controlled fps/size.
+    Sample frames using our Ingestor (which now enforces scaling).
     """
-    # We intentionally scale & fps-filter so comparison is apples-to-apples.
-    vf = f"scale={cfg.width}:{cfg.height},fps={cfg.sample_fps}"
-    cmd = [
-        "ffmpeg",
-        "-loglevel", cfg.loglevel,
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
-        "-analyzeduration", "0",
-        "-probesize", "32",
-        "-i", url,
-        "-an",
-        "-vf", vf,
-        "-pix_fmt", "bgr24",
-        "-f", "rawvideo",
-        "-vsync", "0",
-        "-",
-    ]
-    return sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
-
-
-def _read_exact(pipe, nbytes: int) -> bytes:
-    data = b""
-    while len(data) < nbytes:
-        chunk = pipe.read(nbytes - len(data))
-        if not chunk:
-            break
-        data += chunk
-    return data
-
-
-def sample_frames(url: str, cfg: SampleConfig) -> Tuple[List[np.ndarray], List[float], str]:
-    """
-    Returns (frames, capture_times_monotonic, ffmpeg_stderr_tail).
-    """
-    frame_size = cfg.width * cfg.height * 3
-    p = _ffmpeg_raw_bgr_reader(url, cfg)
-
-    # Warmup: allow stream decoder to stabilize a bit
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < cfg.warmup_seconds:
-        raw = _read_exact(p.stdout, frame_size) if p.stdout else b""
-        if len(raw) != frame_size:
-            break
+    base, key = split_rtmp_url(url)
+    ing = Ingestor(
+        base,
+        key,
+        cfg.width,
+        cfg.height,
+        ffmpeg_bin=cfg.ffmpeg_bin,
+        loglevel=cfg.loglevel,
+        watermark_text=cfg.watermark_text,
+    ).initialize()
 
     frames: List[np.ndarray] = []
     ts: List[float] = []
 
     wanted = max(1, int(cfg.sample_seconds * cfg.sample_fps))
-    for _ in range(wanted):
-        raw = _read_exact(p.stdout, frame_size) if p.stdout else b""
-        if len(raw) != frame_size:
-            break
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape((cfg.height, cfg.width, 3))
-        frames.append(arr.copy())  # copy so buffer isn't reused
-        ts.append(time.monotonic())
+    period = 1.0 / max(1e-6, cfg.sample_fps)
 
-    # Stop process
     try:
-        p.terminate()
-    except Exception:
-        pass
-    try:
-        p.wait(timeout=2)
-    except Exception:
+        # warmup
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < cfg.warmup_seconds:
+            if not ing.grab():
+                break
+
+        for _ in range(wanted):
+            t_start = time.monotonic()
+            if not ing.grab():
+                break
+            frame = ing.read()
+            frames.append(frame.copy())
+            ts.append(time.monotonic())
+
+            elapsed = time.monotonic() - t_start
+            sleep_for = period - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    finally:
         try:
-            p.kill()
+            ing.stop()
         except Exception:
             pass
 
-    # Capture some stderr (can be large)
-    stderr_tail = b""
-    try:
-        if p.stderr:
-            stderr_tail = p.stderr.read()[-4000:]
-    except Exception:
-        pass
-    return frames, ts, stderr_tail.decode(errors="ignore")
+    return frames, ts
 
 
 # -----------------------------
@@ -218,7 +191,6 @@ def to_gray_u8(frame: np.ndarray) -> np.ndarray:
 
 
 def psnr(a: np.ndarray, b: np.ndarray) -> float:
-    # expects uint8 or float; convert to float for mse
     af = a.astype(np.float32)
     bf = b.astype(np.float32)
     mse = np.mean((af - bf) ** 2)
@@ -233,12 +205,10 @@ def mae(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def brightness_contrast(gray: np.ndarray) -> Tuple[float, float]:
-    # mean and stddev
     return float(np.mean(gray)), float(np.std(gray))
 
 
 def hist_distance(gray_a: np.ndarray, gray_b: np.ndarray) -> float:
-    # Bhattacharyya distance on 256-bin histograms
     ha = cv2.calcHist([gray_a], [0], None, [256], [0, 256])
     hb = cv2.calcHist([gray_b], [0], None, [256], [0, 256])
     cv2.normalize(ha, ha)
@@ -248,11 +218,6 @@ def hist_distance(gray_a: np.ndarray, gray_b: np.ndarray) -> float:
 
 
 def watermark_roi_delta(a: np.ndarray, b: np.ndarray, roi=(0, 0, 360, 40)) -> float:
-    """
-    Simple heuristic: compare top-left ROI average absolute difference.
-    Useful to confirm watermark overlay changed pixels in the expected region.
-    roi = (x, y, w, h)
-    """
     x, y, w, h = roi
     ra = a[y:y+h, x:x+w]
     rb = b[y:y+h, x:x+w]
@@ -267,11 +232,6 @@ def estimate_latency_luma_xcorr(
     sample_fps: float,
     max_shift_frames: int = 30,
 ) -> Optional[float]:
-    """
-    Rough latency estimate by cross-correlating mean luma time series.
-    Works best if the scene has motion or brightness changes.
-    Returns latency seconds (out lags in) if detectable.
-    """
     n = min(len(in_frames), len(out_frames))
     if n < 10:
         return None
@@ -279,14 +239,12 @@ def estimate_latency_luma_xcorr(
     in_l = np.array([np.mean(to_gray_u8(f)) for f in in_frames[:n]], dtype=np.float32)
     out_l = np.array([np.mean(to_gray_u8(f)) for f in out_frames[:n]], dtype=np.float32)
 
-    # normalize
     in_l = (in_l - in_l.mean()) / (in_l.std() + 1e-6)
     out_l = (out_l - out_l.mean()) / (out_l.std() + 1e-6)
 
     best_shift = None
     best_score = -1e9
 
-    # shift > 0 means out is delayed relative to in
     for shift in range(-max_shift_frames, max_shift_frames + 1):
         if shift >= 0:
             a = in_l[: n - shift]
@@ -301,45 +259,13 @@ def estimate_latency_luma_xcorr(
             best_score = score
             best_shift = shift
 
-    if best_shift is None:
+    if best_shift is None or best_score < 0.3:
         return None
 
-    # If correlation is weak, don't claim a latency
-    if best_score < 0.3:
-        return None
-
-    latency_s = best_shift / float(sample_fps)
-    # positive latency means output lags input
-    return float(latency_s)
+    return float(best_shift / float(sample_fps))
 
 
-# -----------------------------
-# Reporting / artifacts
-# -----------------------------
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def save_artifacts(
-    out_dir: str,
-    in_frames: List[np.ndarray],
-    out_frames: List[np.ndarray],
-    pairs: int = 5,
-) -> None:
-    ensure_dir(out_dir)
-    n = min(len(in_frames), len(out_frames), pairs)
-    for i in range(n):
-        a = in_frames[i]
-        b = out_frames[i]
-        diff = cv2.absdiff(a, b)
-        cv2.imwrite(os.path.join(out_dir, f"in_{i:03d}.png"), a)
-        cv2.imwrite(os.path.join(out_dir, f"out_{i:03d}.png"), b)
-        cv2.imwrite(os.path.join(out_dir, f"diff_{i:03d}.png"), diff)
-
-
-def analyze_pairwise(
-    in_frames: List[np.ndarray], out_frames: List[np.ndarray], sample_fps: float
-) -> Dict[str, Any]:
+def analyze_pairwise(in_frames: List[np.ndarray], out_frames: List[np.ndarray], sample_fps: float) -> Dict[str, Any]:
     n = min(len(in_frames), len(out_frames))
     if n == 0:
         return {"ok": False, "error": "No frames captured from one or both streams."}
@@ -388,31 +314,155 @@ def analyze_pairwise(
             "watermark_roi_mae_mean": float(np.mean(wm_deltas)),
         },
         "latency_estimate_seconds": latency,
-        "notes": [
-            "MAE is pixel-level mean absolute error (lower is better).",
-            "PSNR is on grayscale frames (higher is better). Values > 35 dB typically indicate close similarity.",
-            "Histogram Bhattacharyya distance (lower is better).",
-            "Latency estimate is best-effort via luma cross-correlation; requires visible motion/changes.",
-            "Watermark ROI delta is a heuristic that checks top-left region differences.",
-        ],
     }
+
+
+# -----------------------------
+# Artifacts
+# -----------------------------
+def save_artifacts(out_dir: str, in_frames: List[np.ndarray], out_frames: List[np.ndarray], pairs: int = 5) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    n = min(len(in_frames), len(out_frames), pairs)
+    for i in range(n):
+        a = in_frames[i]
+        b = out_frames[i]
+        diff = cv2.absdiff(a, b)
+        cv2.imwrite(os.path.join(out_dir, f"in_{i:03d}.png"), a)
+        cv2.imwrite(os.path.join(out_dir, f"out_{i:03d}.png"), b)
+        cv2.imwrite(os.path.join(out_dir, f"diff_{i:03d}.png"), diff)
+
+
+# -----------------------------
+# Broadcaster analysis: test relay
+# -----------------------------
+def run_test_relay(
+    in_url: str,
+    out_url: str,
+    cfg: SampleConfig,
+    duration_s: float,
+    audiodelay: float,
+    video_bitrate: str,
+    gop: int,
+    audio_copy: bool,
+) -> Dict[str, Any]:
+    """
+    Runs a controlled relay: input -> Broadcastor -> out_url for duration_s.
+    Returns broadcaster stats (push fps, failures, alive, etc.).
+    """
+    in_base, in_key = split_rtmp_url(in_url)
+    out_base, out_key = split_rtmp_url(out_url)
+
+    # Ingest frames WITHOUT watermark (we want analysis on raw relay behavior).
+    ing = Ingestor(
+        in_base,
+        in_key,
+        cfg.width,
+        cfg.height,
+        ffmpeg_bin=cfg.ffmpeg_bin,
+        loglevel=cfg.loglevel,
+        watermark_text="",  # raw frames in this test
+    ).initialize()
+
+    bc = Broadcastor(
+        out_base,
+        out_key,
+        cfg.width,
+        cfg.height,
+        sourceurl=in_url,  # use input url for audio
+        ffmpeg_bin=cfg.ffmpeg_bin,
+        loglevel=cfg.loglevel,
+        audiodelay=audiodelay,
+        video_bitrate=video_bitrate,
+        audio_copy=audio_copy,
+        gop=gop,
+    ).initialize()
+
+    pushed = 0
+    write_failures = 0
+    grabbed = 0
+    started = time.monotonic()
+
+    try:
+        while time.monotonic() - started < duration_s:
+            if not ing.grab():
+                break
+            frame = ing.read()
+            grabbed += 1
+            ok = bc.write(frame)
+            if ok:
+                pushed += 1
+            else:
+                write_failures += 1
+                # if broadcaster died, stop early
+                if not bc.is_alive():
+                    break
+    finally:
+        try:
+            ing.stop()
+        except Exception:
+            pass
+        try:
+            bc.stop()
+        except Exception:
+            pass
+
+    elapsed = max(1e-6, time.monotonic() - started)
+    stats = {
+        "duration_s": float(elapsed),
+        "frames_grabbed": grabbed,
+        "frames_pushed": pushed,
+        "write_failures": write_failures + getattr(bc, "write_failures", 0),
+        "pushed_fps": float(pushed / elapsed),
+        "broadcaster_alive_end": bool(bc.is_alive()) if hasattr(bc, "is_alive") else None,
+        "broadcaster_internal": {
+            "frames_pushed": getattr(bc, "frames_pushed", None),
+            "write_failures": getattr(bc, "write_failures", None),
+            "pushed_fps": getattr(bc, "pushed_fps", lambda: None)(),
+        },
+    }
+    return stats
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Compare input and output RTMP streams (quality + metadata + latency)."
+        description="Analyze RTMP relay quality + broadcaster performance using rtmp_opencv.relay."
     )
     ap.add_argument("--in-url", required=True, help="Full input RTMP URL")
     ap.add_argument("--out-url", required=True, help="Full output RTMP URL")
-    ap.add_argument("--width", type=int, default=640, help="Sampling width (scaled)")
-    ap.add_argument("--height", type=int, default=360, help="Sampling height (scaled)")
-    ap.add_argument("--sample-seconds", type=float, default=10.0, help="How long to sample each stream")
-    ap.add_argument("--sample-fps", type=float, default=10.0, help="Sampling fps for comparison")
-    ap.add_argument("--warmup-seconds", type=float, default=2.0, help="Warmup decode before sampling")
-    ap.add_argument("--loglevel", default="error", help="ffmpeg loglevel for samplers (error|warning|info)")
-    ap.add_argument("--artifacts", default="artifacts/video_analysis", help="Output artifacts dir")
-    ap.add_argument("--pairs", type=int, default=5, help="How many frame pairs to save as PNG")
+
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=360)
+
+    ap.add_argument("--sample-seconds", type=float, default=10.0, help="Sampling duration for quality comparison")
+    ap.add_argument("--sample-fps", type=float, default=10.0)
+    ap.add_argument("--warmup-seconds", type=float, default=2.0)
+
+    ap.add_argument("--ffmpeg", default="ffmpeg")
+    ap.add_argument("--loglevel", default="error", help="ffmpeg loglevel for analysis and relay test")
+
+    ap.add_argument("--artifacts", default="artifacts/video_analysis")
+    ap.add_argument("--pairs", type=int, default=5)
+
+    # broadcaster test controls
+    ap.add_argument("--test-relay", action="store_true", help="Run a controlled relay test before sampling output")
+    ap.add_argument("--test-duration", type=float, default=8.0, help="Seconds to run controlled relay test")
+    ap.add_argument("--audiodelay", type=float, default=2.0)
+    ap.add_argument("--video-bitrate", default="2M")
+    ap.add_argument("--gop", type=int, default=30)
+    ap.add_argument("--audio-copy", action="store_true", help="Use -c:a copy in broadcaster (default)")
+    ap.add_argument("--audio-aac", action="store_true", help="Force AAC encode instead of copy")
+
+    # watermark option for sampling (off by default)
+    ap.add_argument("--watermark", default="", help="If set, applies watermark during sampling")
+
     args = ap.parse_args()
+
+    # resolve audio mode
+    audio_copy = True
+    if args.audio_aac:
+        audio_copy = False
+    if args.audio_copy:
+        audio_copy = True
 
     os.makedirs(args.artifacts, exist_ok=True)
     ts_label = time.strftime("%Y%m%d_%H%M%S")
@@ -426,63 +476,91 @@ def main():
         sample_fps=args.sample_fps,
         warmup_seconds=args.warmup_seconds,
         loglevel=args.loglevel,
+        ffmpeg_bin=args.ffmpeg,
+        watermark_text=args.watermark,
     )
-
-    print("=== ffprobe (input) ===")
-    in_probe = ffprobe_summary(args.in_url)
-    print(json.dumps(in_probe, indent=2))
-
-    print("\n=== ffprobe (output) ===")
-    out_probe = ffprobe_summary(args.out_url)
-    print(json.dumps(out_probe, indent=2))
-
-    print("\n=== sampling frames ===")
-    in_frames, in_ts, in_stderr = sample_frames(args.in_url, cfg)
-    out_frames, out_ts, out_stderr = sample_frames(args.out_url, cfg)
-
-    print(f"Captured input frames:  {len(in_frames)}")
-    print(f"Captured output frames: {len(out_frames)}")
-
-    if in_stderr.strip():
-        with open(os.path.join(out_dir, "ffmpeg_in_stderr_tail.txt"), "w", encoding="utf-8") as f:
-            f.write(in_stderr)
-    if out_stderr.strip():
-        with open(os.path.join(out_dir, "ffmpeg_out_stderr_tail.txt"), "w", encoding="utf-8") as f:
-            f.write(out_stderr)
 
     report: Dict[str, Any] = {
         "timestamp": ts_label,
         "config": asdict(cfg),
-        "input_probe": in_probe,
-        "output_probe": out_probe,
-        "capture": {
-            "input_frames": len(in_frames),
-            "output_frames": len(out_frames),
-        },
-        "analysis": analyze_pairwise(in_frames, out_frames, sample_fps=cfg.sample_fps),
+        "input_probe_before": ffprobe_summary(args.in_url),
+        "output_probe_before": ffprobe_summary(args.out_url),
+        "broadcaster_test": None,
+        "quality": None,
+        "output_probe_after": None,
     }
 
-    # Save artifacts (paired frames + diffs)
+    print("=== ffprobe (input/before) ===")
+    print(json.dumps(report["input_probe_before"], indent=2))
+    print("\n=== ffprobe (output/before) ===")
+    print(json.dumps(report["output_probe_before"], indent=2))
+
+    # Optional: run a controlled relay test (broadcaster analysis)
+    if args.test_relay:
+        print("\n=== running controlled relay test (broadcaster analysis) ===")
+        bstats = run_test_relay(
+            args.in_url,
+            args.out_url,
+            cfg,
+            duration_s=args.test_duration,
+            audiodelay=args.audiodelay,
+            video_bitrate=args.video_bitrate,
+            gop=args.gop,
+            audio_copy=audio_copy,
+        )
+        report["broadcaster_test"] = bstats
+        print(json.dumps(bstats, indent=2))
+
+        # Give output a moment to stabilize post-test
+        time.sleep(1.0)
+
+    # Quality sampling: input + output
+    print("\n=== sampling frames via Ingestor (quality analysis) ===")
+    in_frames, _ = sample_frames(args.in_url, cfg)
+    out_frames, _ = sample_frames(args.out_url, cfg)
+
+    print(f"Captured input frames:  {len(in_frames)}")
+    print(f"Captured output frames: {len(out_frames)}")
+
+    report["quality"] = analyze_pairwise(in_frames, out_frames, sample_fps=cfg.sample_fps)
+
     save_artifacts(out_dir, in_frames, out_frames, pairs=args.pairs)
 
-    # Write report JSON
+    # Probe output after sampling (might differ if test-relay ran)
+    report["output_probe_after"] = ffprobe_summary(args.out_url)
+
+    # Write report
     report_path = os.path.join(out_dir, "report.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    print("\n=== analysis summary ===")
-    if report["analysis"].get("ok"):
-        m = report["analysis"]["metrics"]
-        print(f"Frames compared: {report['analysis']['frames_compared']}")
-        print(f"MAE mean:       {m['mae_mean']:.3f} (p95={m['mae_p95']:.3f})")
-        print(f"PSNR mean:      {m['psnr_gray_mean']:.2f} dB (p05={m['psnr_gray_p05']:.2f} dB)")
-        print(f"Hist dist mean: {m['hist_bhattacharyya_mean']:.4f}")
-        print(f"Brightness in/out: {m['in_brightness_mean']:.2f} / {m['out_brightness_mean']:.2f}")
-        print(f"Contrast in/out:   {m['in_contrast_std_mean']:.2f} / {m['out_contrast_std_mean']:.2f}")
-        print(f"Watermark ROI Δ:   {m['watermark_roi_mae_mean']:.3f}")
-        print(f"Latency estimate:  {report['analysis']['latency_estimate_seconds']} (seconds, best-effort)")
+    print("\n=== ffprobe (output/after) ===")
+    print(json.dumps(report["output_probe_after"], indent=2))
+
+    print("\n=== quality summary ===")
+    q = report["quality"]
+    if q and q.get("ok"):
+        m = q["metrics"]
+        print(f"Frames compared:    {q['frames_compared']}")
+        print(f"MAE mean:           {m['mae_mean']:.3f} (p95={m['mae_p95']:.3f})")
+        print(f"PSNR mean:          {m['psnr_gray_mean']:.2f} dB (p05={m['psnr_gray_p05']:.2f} dB)")
+        print(f"Hist dist mean:     {m['hist_bhattacharyya_mean']:.4f}")
+        print(f"Brightness in/out:  {m['in_brightness_mean']:.2f} / {m['out_brightness_mean']:.2f}")
+        print(f"Contrast in/out:    {m['in_contrast_std_mean']:.2f} / {m['out_contrast_std_mean']:.2f}")
+        print(f"Watermark ROI Δ:    {m['watermark_roi_mae_mean']:.3f}")
+        print(f"Latency estimate:   {q.get('latency_estimate_seconds')} seconds (best-effort)")
     else:
-        print("Analysis failed:", report["analysis"].get("error"))
+        print("Quality analysis failed:", (q or {}).get("error"))
+
+    if report.get("broadcaster_test"):
+        b = report["broadcaster_test"]
+        print("\n=== broadcaster summary ===")
+        print(f"Test duration:      {b['duration_s']:.2f}s")
+        print(f"Frames grabbed:     {b['frames_grabbed']}")
+        print(f"Frames pushed:      {b['frames_pushed']}")
+        print(f"Write failures:     {b['write_failures']}")
+        print(f"Pushed FPS:         {b['pushed_fps']:.2f}")
+        print(f"Broadcaster alive:  {b['broadcaster_alive_end']}")
 
     print(f"\nArtifacts written to: {out_dir}")
     print(f"Report: {report_path}")
