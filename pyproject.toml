@@ -23,11 +23,6 @@ dependencies = [
   "opencv-python-headless"
 ]
 
-[project.optional-dependencies]
-analysis = [
-  "pytesseract"
-]
-
 [project.urls]
 Homepage = "https://github.com/nishanthkottapalli/rtmp-opencv-relay"
 Repository = "https://github.com/nishanthkottapalli/rtmp-opencv-relay"
