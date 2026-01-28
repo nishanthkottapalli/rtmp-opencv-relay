@@ -132,6 +132,7 @@ class SampleConfig:
 
 
 def split_rtmp_url(url: str) -> Tuple[str, str]:
+    url = url.rstrip("/")
     base, key = url.rsplit("/", 1)
     return base + "/", key
 
@@ -146,7 +147,7 @@ def sample_frames(url: str, cfg: SampleConfig, *, disable_overlays: bool = True)
         ffmpeg_bin=cfg.ffmpeg_bin,
         loglevel=cfg.loglevel,
         watermark_text=cfg.watermark_text if not disable_overlays else "",
-        timecode_7seg_overlay=False,  # sampling should not modify
+        timecode_7seg_overlay=False,
     ).initialize()
 
     frames: List[np.ndarray] = []
@@ -273,12 +274,7 @@ def analyze_pairwise(in_frames: List[np.ndarray], out_frames: List[np.ndarray]) 
 # -----------------------------
 # 7-seg decode (deterministic latency)
 # -----------------------------
-# Must match relay.py drawing params default.
-DIGITS = "0123456789"
-
-
 def _segments_for_digit(d: int) -> Tuple[int, int, int, int, int, int, int]:
-    # a b c d e f g
     table = {
         0: (1, 1, 1, 1, 1, 1, 0),
         1: (0, 1, 1, 0, 0, 0, 0),
@@ -294,7 +290,7 @@ def _segments_for_digit(d: int) -> Tuple[int, int, int, int, int, int, int]:
     return table[d]
 
 
-_SEG_TO_DIGIT = { _segments_for_digit(d): d for d in range(10) }
+_SEG_TO_DIGIT = {_segments_for_digit(d): d for d in range(10)}
 
 
 def decode_7seg_epoch_ms(
@@ -308,10 +304,6 @@ def decode_7seg_epoch_ms(
     digits: int = 13,
     bg_padding: int = 8,
 ) -> Optional[int]:
-    """
-    Decode epoch_ms from a frame with our 7-seg overlay.
-    Returns int(epoch_ms) or None.
-    """
     h, w = frame.shape[:2]
     digit_w = seg_len + 2 * seg_th
     digit_h = 2 * seg_len + 3 * seg_th
@@ -325,7 +317,6 @@ def decode_7seg_epoch_ms(
         x0 = margin
         y0 = h - margin - total_h
 
-    # include background padding region to be safe, but decode within digit area
     x1 = max(0, x0 - bg_padding)
     y1 = max(0, y0 - bg_padding)
     x2 = min(w, x0 + total_w + bg_padding)
@@ -335,19 +326,13 @@ def decode_7seg_epoch_ms(
         return None
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    # binary threshold (overlay is white on black)
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Digit decode: sample in each segment center
-    # map coordinates into ROI space
     def sample(px: int, py: int) -> int:
-        # clamp
         px = max(0, min(bw.shape[1] - 1, px))
         py = max(0, min(bw.shape[0] - 1, py))
         return int(bw[py, px] > 0)
 
-    # digit top-left within ROI
     dx0 = x0 - x1
     dy0 = y0 - y1
 
@@ -356,22 +341,14 @@ def decode_7seg_epoch_ms(
         ox = dx0 + i * (digit_w + spacing)
         oy = dy0
 
-        # segment sample points (centers)
-        # a: top horizontal
         a = sample(ox + seg_th + seg_len // 2, oy + seg_th // 2)
-        # g: middle horizontal
         g = sample(ox + seg_th + seg_len // 2, oy + seg_len + seg_th + seg_th // 2)
-        # d: bottom horizontal
         dseg = sample(ox + seg_th + seg_len // 2, oy + 2 * seg_len + 2 * seg_th + seg_th // 2)
 
-        # f: upper-left vertical
         f = sample(ox + seg_th // 2, oy + seg_th + seg_len // 2)
-        # b: upper-right vertical
         b = sample(ox + seg_th + seg_len + seg_th // 2, oy + seg_th + seg_len // 2)
 
-        # e: lower-left vertical
         e = sample(ox + seg_th // 2, oy + 2 * seg_th + seg_len + seg_len // 2)
-        # c: lower-right vertical
         c = sample(ox + seg_th + seg_len + seg_th // 2, oy + 2 * seg_th + seg_len + seg_len // 2)
 
         seg_tuple = (a, b, c, dseg, e, f, g)
@@ -435,11 +412,6 @@ def deterministic_latency_from_output_frames(
             "max": int(np.max(arr)),
         },
         "examples": examples,
-        "notes": [
-            "Deterministic latency = (now_epoch_ms - embedded_epoch_ms) decoded from 7-seg overlay.",
-            "This includes network, server buffering, encoder/decoder latency, and any CDN buffering.",
-            "If parse_rate is low, increase bitrate/resolution or increase seg_len/seg_th in relay overlay.",
-        ],
     }
 
 
@@ -637,7 +609,6 @@ def main():
 
     report["quality"] = analyze_pairwise(in_frames, out_frames)
 
-    # Save a few artifacts (including potentially the overlay region on output)
     def save_pairs(pairs: int = 5):
         n = min(len(in_frames), len(out_frames), pairs)
         for i in range(n):
