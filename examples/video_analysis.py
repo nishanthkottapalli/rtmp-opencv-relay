@@ -13,6 +13,10 @@ import numpy as np
 from rtmp_opencv.relay import Ingestor, Broadcastor
 
 
+def _epoch_ms() -> int:
+    return int(time.time() * 1000)
+
+
 # -----------------------------
 # ffprobe
 # -----------------------------
@@ -128,16 +132,11 @@ class SampleConfig:
 
 
 def split_rtmp_url(url: str) -> Tuple[str, str]:
-    if "/" not in url:
-        raise ValueError(f"Invalid RTMP URL: {url}")
     base, key = url.rsplit("/", 1)
     return base + "/", key
 
 
-def sample_frames(url: str, cfg: SampleConfig) -> Tuple[List[np.ndarray], List[float]]:
-    """
-    Sample frames using our Ingestor (which now enforces scaling).
-    """
+def sample_frames(url: str, cfg: SampleConfig, *, disable_overlays: bool = True) -> List[np.ndarray]:
     base, key = split_rtmp_url(url)
     ing = Ingestor(
         base,
@@ -146,17 +145,15 @@ def sample_frames(url: str, cfg: SampleConfig) -> Tuple[List[np.ndarray], List[f
         cfg.height,
         ffmpeg_bin=cfg.ffmpeg_bin,
         loglevel=cfg.loglevel,
-        watermark_text=cfg.watermark_text,
+        watermark_text=cfg.watermark_text if not disable_overlays else "",
+        timecode_7seg_overlay=False,  # sampling should not modify
     ).initialize()
 
     frames: List[np.ndarray] = []
-    ts: List[float] = []
-
     wanted = max(1, int(cfg.sample_seconds * cfg.sample_fps))
     period = 1.0 / max(1e-6, cfg.sample_fps)
 
     try:
-        # warmup
         t0 = time.monotonic()
         while time.monotonic() - t0 < cfg.warmup_seconds:
             if not ing.grab():
@@ -166,9 +163,7 @@ def sample_frames(url: str, cfg: SampleConfig) -> Tuple[List[np.ndarray], List[f
             t_start = time.monotonic()
             if not ing.grab():
                 break
-            frame = ing.read()
-            frames.append(frame.copy())
-            ts.append(time.monotonic())
+            frames.append(ing.read().copy())
 
             elapsed = time.monotonic() - t_start
             sleep_for = period - elapsed
@@ -180,11 +175,11 @@ def sample_frames(url: str, cfg: SampleConfig) -> Tuple[List[np.ndarray], List[f
         except Exception:
             pass
 
-    return frames, ts
+    return frames
 
 
 # -----------------------------
-# Metrics
+# Pairwise quality metrics
 # -----------------------------
 def to_gray_u8(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -226,46 +221,7 @@ def watermark_roi_delta(a: np.ndarray, b: np.ndarray, roi=(0, 0, 360, 40)) -> fl
     return mae(ra, rb)
 
 
-def estimate_latency_luma_xcorr(
-    in_frames: List[np.ndarray],
-    out_frames: List[np.ndarray],
-    sample_fps: float,
-    max_shift_frames: int = 30,
-) -> Optional[float]:
-    n = min(len(in_frames), len(out_frames))
-    if n < 10:
-        return None
-
-    in_l = np.array([np.mean(to_gray_u8(f)) for f in in_frames[:n]], dtype=np.float32)
-    out_l = np.array([np.mean(to_gray_u8(f)) for f in out_frames[:n]], dtype=np.float32)
-
-    in_l = (in_l - in_l.mean()) / (in_l.std() + 1e-6)
-    out_l = (out_l - out_l.mean()) / (out_l.std() + 1e-6)
-
-    best_shift = None
-    best_score = -1e9
-
-    for shift in range(-max_shift_frames, max_shift_frames + 1):
-        if shift >= 0:
-            a = in_l[: n - shift]
-            b = out_l[shift:n]
-        else:
-            a = in_l[-shift:n]
-            b = out_l[: n + shift]
-        if len(a) < 5:
-            continue
-        score = float(np.dot(a, b) / len(a))
-        if score > best_score:
-            best_score = score
-            best_shift = shift
-
-    if best_shift is None or best_score < 0.3:
-        return None
-
-    return float(best_shift / float(sample_fps))
-
-
-def analyze_pairwise(in_frames: List[np.ndarray], out_frames: List[np.ndarray], sample_fps: float) -> Dict[str, Any]:
+def analyze_pairwise(in_frames: List[np.ndarray], out_frames: List[np.ndarray]) -> Dict[str, Any]:
     n = min(len(in_frames), len(out_frames))
     if n == 0:
         return {"ok": False, "error": "No frames captured from one or both streams."}
@@ -296,8 +252,6 @@ def analyze_pairwise(in_frames: List[np.ndarray], out_frames: List[np.ndarray], 
 
         wm_deltas.append(watermark_roi_delta(a, b))
 
-    latency = estimate_latency_luma_xcorr(in_frames[:n], out_frames[:n], sample_fps=sample_fps)
-
     return {
         "ok": True,
         "frames_compared": n,
@@ -313,29 +267,186 @@ def analyze_pairwise(in_frames: List[np.ndarray], out_frames: List[np.ndarray], 
             "out_contrast_std_mean": float(np.mean(out_c)),
             "watermark_roi_mae_mean": float(np.mean(wm_deltas)),
         },
-        "latency_estimate_seconds": latency,
     }
 
 
 # -----------------------------
-# Artifacts
+# 7-seg decode (deterministic latency)
 # -----------------------------
-def save_artifacts(out_dir: str, in_frames: List[np.ndarray], out_frames: List[np.ndarray], pairs: int = 5) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    n = min(len(in_frames), len(out_frames), pairs)
-    for i in range(n):
-        a = in_frames[i]
-        b = out_frames[i]
-        diff = cv2.absdiff(a, b)
-        cv2.imwrite(os.path.join(out_dir, f"in_{i:03d}.png"), a)
-        cv2.imwrite(os.path.join(out_dir, f"out_{i:03d}.png"), b)
-        cv2.imwrite(os.path.join(out_dir, f"diff_{i:03d}.png"), diff)
+# Must match relay.py drawing params default.
+DIGITS = "0123456789"
+
+
+def _segments_for_digit(d: int) -> Tuple[int, int, int, int, int, int, int]:
+    # a b c d e f g
+    table = {
+        0: (1, 1, 1, 1, 1, 1, 0),
+        1: (0, 1, 1, 0, 0, 0, 0),
+        2: (1, 1, 0, 1, 1, 0, 1),
+        3: (1, 1, 1, 1, 0, 0, 1),
+        4: (0, 1, 1, 0, 0, 1, 1),
+        5: (1, 0, 1, 1, 0, 1, 1),
+        6: (1, 0, 1, 1, 1, 1, 1),
+        7: (1, 1, 1, 0, 0, 0, 0),
+        8: (1, 1, 1, 1, 1, 1, 1),
+        9: (1, 1, 1, 1, 0, 1, 1),
+    }
+    return table[d]
+
+
+_SEG_TO_DIGIT = { _segments_for_digit(d): d for d in range(10) }
+
+
+def decode_7seg_epoch_ms(
+    frame: np.ndarray,
+    *,
+    position: str = "bl",
+    seg_len: int = 18,
+    seg_th: int = 4,
+    spacing: int = 6,
+    margin: int = 10,
+    digits: int = 13,
+    bg_padding: int = 8,
+) -> Optional[int]:
+    """
+    Decode epoch_ms from a frame with our 7-seg overlay.
+    Returns int(epoch_ms) or None.
+    """
+    h, w = frame.shape[:2]
+    digit_w = seg_len + 2 * seg_th
+    digit_h = 2 * seg_len + 3 * seg_th
+    total_w = digits * digit_w + (digits - 1) * spacing
+    total_h = digit_h
+
+    if position == "tl":
+        x0 = margin
+        y0 = margin
+    else:
+        x0 = margin
+        y0 = h - margin - total_h
+
+    # include background padding region to be safe, but decode within digit area
+    x1 = max(0, x0 - bg_padding)
+    y1 = max(0, y0 - bg_padding)
+    x2 = min(w, x0 + total_w + bg_padding)
+    y2 = min(h, y0 + total_h + bg_padding)
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # binary threshold (overlay is white on black)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Digit decode: sample in each segment center
+    # map coordinates into ROI space
+    def sample(px: int, py: int) -> int:
+        # clamp
+        px = max(0, min(bw.shape[1] - 1, px))
+        py = max(0, min(bw.shape[0] - 1, py))
+        return int(bw[py, px] > 0)
+
+    # digit top-left within ROI
+    dx0 = x0 - x1
+    dy0 = y0 - y1
+
+    out_digits = []
+    for i in range(digits):
+        ox = dx0 + i * (digit_w + spacing)
+        oy = dy0
+
+        # segment sample points (centers)
+        # a: top horizontal
+        a = sample(ox + seg_th + seg_len // 2, oy + seg_th // 2)
+        # g: middle horizontal
+        g = sample(ox + seg_th + seg_len // 2, oy + seg_len + seg_th + seg_th // 2)
+        # d: bottom horizontal
+        dseg = sample(ox + seg_th + seg_len // 2, oy + 2 * seg_len + 2 * seg_th + seg_th // 2)
+
+        # f: upper-left vertical
+        f = sample(ox + seg_th // 2, oy + seg_th + seg_len // 2)
+        # b: upper-right vertical
+        b = sample(ox + seg_th + seg_len + seg_th // 2, oy + seg_th + seg_len // 2)
+
+        # e: lower-left vertical
+        e = sample(ox + seg_th // 2, oy + 2 * seg_th + seg_len + seg_len // 2)
+        # c: lower-right vertical
+        c = sample(ox + seg_th + seg_len + seg_th // 2, oy + 2 * seg_th + seg_len + seg_len // 2)
+
+        seg_tuple = (a, b, c, dseg, e, f, g)
+        if seg_tuple not in _SEG_TO_DIGIT:
+            return None
+        out_digits.append(str(_SEG_TO_DIGIT[seg_tuple]))
+
+    try:
+        return int("".join(out_digits))
+    except Exception:
+        return None
+
+
+def deterministic_latency_from_output_frames(
+    out_frames: List[np.ndarray],
+    *,
+    position: str,
+    seg_len: int,
+    seg_th: int,
+    spacing: int,
+    margin: int,
+) -> Dict[str, Any]:
+    latencies = []
+    parsed = 0
+    total = 0
+    examples = []
+
+    for f in out_frames:
+        total += 1
+        embedded = decode_7seg_epoch_ms(
+            f,
+            position=position,
+            seg_len=seg_len,
+            seg_th=seg_th,
+            spacing=spacing,
+            margin=margin,
+        )
+        if embedded is None:
+            continue
+        parsed += 1
+        now = _epoch_ms()
+        lat = now - embedded
+        latencies.append(int(lat))
+        if len(examples) < 5:
+            examples.append({"embedded_ms": embedded, "now_ms": now, "latency_ms": int(lat)})
+
+    if parsed == 0:
+        return {"ok": False, "error": "No parseable 7-seg timecodes found in output frames.", "frames_total": total}
+
+    arr = np.array(latencies, dtype=np.int64)
+    return {
+        "ok": True,
+        "frames_total": total,
+        "frames_parsed": parsed,
+        "parse_rate": float(parsed / max(1, total)),
+        "latency_ms": {
+            "mean": float(np.mean(arr)),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+            "min": int(np.min(arr)),
+            "max": int(np.max(arr)),
+        },
+        "examples": examples,
+        "notes": [
+            "Deterministic latency = (now_epoch_ms - embedded_epoch_ms) decoded from 7-seg overlay.",
+            "This includes network, server buffering, encoder/decoder latency, and any CDN buffering.",
+            "If parse_rate is low, increase bitrate/resolution or increase seg_len/seg_th in relay overlay.",
+        ],
+    }
 
 
 # -----------------------------
-# Broadcaster analysis: test relay
+# Broadcaster test relay (with 7-seg overlay ON)
 # -----------------------------
-def run_test_relay(
+def run_test_relay_with_7seg_timecode(
     in_url: str,
     out_url: str,
     cfg: SampleConfig,
@@ -344,15 +455,15 @@ def run_test_relay(
     video_bitrate: str,
     gop: int,
     audio_copy: bool,
+    timecode_position: str,
+    seg_len: int,
+    seg_th: int,
+    spacing: int,
+    margin: int,
 ) -> Dict[str, Any]:
-    """
-    Runs a controlled relay: input -> Broadcastor -> out_url for duration_s.
-    Returns broadcaster stats (push fps, failures, alive, etc.).
-    """
     in_base, in_key = split_rtmp_url(in_url)
     out_base, out_key = split_rtmp_url(out_url)
 
-    # Ingest frames WITHOUT watermark (we want analysis on raw relay behavior).
     ing = Ingestor(
         in_base,
         in_key,
@@ -360,7 +471,14 @@ def run_test_relay(
         cfg.height,
         ffmpeg_bin=cfg.ffmpeg_bin,
         loglevel=cfg.loglevel,
-        watermark_text="",  # raw frames in this test
+        watermark_text="",
+        timecode_7seg_overlay=True,
+        timecode_position=timecode_position,
+        timecode_seg_len=seg_len,
+        timecode_seg_th=seg_th,
+        timecode_digit_spacing=spacing,
+        timecode_margin_px=margin,
+        timecode_bg=True,
     ).initialize()
 
     bc = Broadcastor(
@@ -368,7 +486,7 @@ def run_test_relay(
         out_key,
         cfg.width,
         cfg.height,
-        sourceurl=in_url,  # use input url for audio
+        sourceurl=in_url,
         ffmpeg_bin=cfg.ffmpeg_bin,
         loglevel=cfg.loglevel,
         audiodelay=audiodelay,
@@ -378,7 +496,7 @@ def run_test_relay(
     ).initialize()
 
     pushed = 0
-    write_failures = 0
+    failures = 0
     grabbed = 0
     started = time.monotonic()
 
@@ -388,12 +506,10 @@ def run_test_relay(
                 break
             frame = ing.read()
             grabbed += 1
-            ok = bc.write(frame)
-            if ok:
+            if bc.write(frame):
                 pushed += 1
             else:
-                write_failures += 1
-                # if broadcaster died, stop early
+                failures += 1
                 if not bc.is_alive():
                     break
     finally:
@@ -407,57 +523,52 @@ def run_test_relay(
             pass
 
     elapsed = max(1e-6, time.monotonic() - started)
-    stats = {
+    return {
         "duration_s": float(elapsed),
         "frames_grabbed": grabbed,
         "frames_pushed": pushed,
-        "write_failures": write_failures + getattr(bc, "write_failures", 0),
+        "write_failures": failures + getattr(bc, "write_failures", 0),
         "pushed_fps": float(pushed / elapsed),
-        "broadcaster_alive_end": bool(bc.is_alive()) if hasattr(bc, "is_alive") else None,
-        "broadcaster_internal": {
-            "frames_pushed": getattr(bc, "frames_pushed", None),
-            "write_failures": getattr(bc, "write_failures", None),
-            "pushed_fps": getattr(bc, "pushed_fps", lambda: None)(),
-        },
+        "broadcaster_alive_end": bool(bc.is_alive()),
     }
-    return stats
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Analyze RTMP relay quality + broadcaster performance using rtmp_opencv.relay."
-    )
-    ap.add_argument("--in-url", required=True, help="Full input RTMP URL")
-    ap.add_argument("--out-url", required=True, help="Full output RTMP URL")
+    ap = argparse.ArgumentParser(description="Analyze RTMP relay quality + broadcaster + deterministic latency (no OCR).")
+    ap.add_argument("--in-url", required=True)
+    ap.add_argument("--out-url", required=True)
 
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=360)
 
-    ap.add_argument("--sample-seconds", type=float, default=10.0, help="Sampling duration for quality comparison")
+    ap.add_argument("--sample-seconds", type=float, default=10.0)
     ap.add_argument("--sample-fps", type=float, default=10.0)
     ap.add_argument("--warmup-seconds", type=float, default=2.0)
 
     ap.add_argument("--ffmpeg", default="ffmpeg")
-    ap.add_argument("--loglevel", default="error", help="ffmpeg loglevel for analysis and relay test")
+    ap.add_argument("--loglevel", default="error")
 
     ap.add_argument("--artifacts", default="artifacts/video_analysis")
     ap.add_argument("--pairs", type=int, default=5)
 
-    # broadcaster test controls
-    ap.add_argument("--test-relay", action="store_true", help="Run a controlled relay test before sampling output")
-    ap.add_argument("--test-duration", type=float, default=8.0, help="Seconds to run controlled relay test")
+    ap.add_argument("--test-relay", action="store_true", help="Run controlled relay test to out-url with 7-seg overlay.")
+    ap.add_argument("--test-duration", type=float, default=8.0)
     ap.add_argument("--audiodelay", type=float, default=2.0)
     ap.add_argument("--video-bitrate", default="2M")
     ap.add_argument("--gop", type=int, default=30)
-    ap.add_argument("--audio-copy", action="store_true", help="Use -c:a copy in broadcaster (default)")
-    ap.add_argument("--audio-aac", action="store_true", help="Force AAC encode instead of copy")
+    ap.add_argument("--audio-copy", action="store_true")
+    ap.add_argument("--audio-aac", action="store_true")
 
-    # watermark option for sampling (off by default)
-    ap.add_argument("--watermark", default="", help="If set, applies watermark during sampling")
+    ap.add_argument("--expect-7seg-timecode", action="store_true", help="Decode deterministic latency from output overlay.")
+    ap.add_argument("--timecode-position", default="bl", choices=["bl", "tl"])
+    ap.add_argument("--timecode-seg-len", type=int, default=18)
+    ap.add_argument("--timecode-seg-th", type=int, default=4)
+    ap.add_argument("--timecode-spacing", type=int, default=6)
+    ap.add_argument("--timecode-margin", type=int, default=10)
 
+    ap.add_argument("--watermark", default="", help="Sampling watermark (avoid for similarity).")
     args = ap.parse_args()
 
-    # resolve audio mode
     audio_copy = True
     if args.audio_aac:
         audio_copy = False
@@ -487,6 +598,7 @@ def main():
         "output_probe_before": ffprobe_summary(args.out_url),
         "broadcaster_test": None,
         "quality": None,
+        "deterministic_latency": None,
         "output_probe_after": None,
     }
 
@@ -495,10 +607,9 @@ def main():
     print("\n=== ffprobe (output/before) ===")
     print(json.dumps(report["output_probe_before"], indent=2))
 
-    # Optional: run a controlled relay test (broadcaster analysis)
     if args.test_relay:
-        print("\n=== running controlled relay test (broadcaster analysis) ===")
-        bstats = run_test_relay(
+        print("\n=== controlled relay test (7-seg overlay ON) ===")
+        bstats = run_test_relay_with_7seg_timecode(
             args.in_url,
             args.out_url,
             cfg,
@@ -507,60 +618,59 @@ def main():
             video_bitrate=args.video_bitrate,
             gop=args.gop,
             audio_copy=audio_copy,
+            timecode_position=args.timecode_position,
+            seg_len=args.timecode_seg_len,
+            seg_th=args.timecode_seg_th,
+            spacing=args.timecode_spacing,
+            margin=args.timecode_margin,
         )
         report["broadcaster_test"] = bstats
         print(json.dumps(bstats, indent=2))
-
-        # Give output a moment to stabilize post-test
         time.sleep(1.0)
 
-    # Quality sampling: input + output
-    print("\n=== sampling frames via Ingestor (quality analysis) ===")
-    in_frames, _ = sample_frames(args.in_url, cfg)
-    out_frames, _ = sample_frames(args.out_url, cfg)
+    print("\n=== sampling frames (quality) ===")
+    in_frames = sample_frames(args.in_url, cfg, disable_overlays=True)
+    out_frames = sample_frames(args.out_url, cfg, disable_overlays=True)
 
     print(f"Captured input frames:  {len(in_frames)}")
     print(f"Captured output frames: {len(out_frames)}")
 
-    report["quality"] = analyze_pairwise(in_frames, out_frames, sample_fps=cfg.sample_fps)
+    report["quality"] = analyze_pairwise(in_frames, out_frames)
 
-    save_artifacts(out_dir, in_frames, out_frames, pairs=args.pairs)
+    # Save a few artifacts (including potentially the overlay region on output)
+    def save_pairs(pairs: int = 5):
+        n = min(len(in_frames), len(out_frames), pairs)
+        for i in range(n):
+            a = in_frames[i]
+            b = out_frames[i]
+            diff = cv2.absdiff(a, b)
+            cv2.imwrite(os.path.join(out_dir, f"in_{i:03d}.png"), a)
+            cv2.imwrite(os.path.join(out_dir, f"out_{i:03d}.png"), b)
+            cv2.imwrite(os.path.join(out_dir, f"diff_{i:03d}.png"), diff)
 
-    # Probe output after sampling (might differ if test-relay ran)
+    save_pairs(args.pairs)
+
+    if args.expect_7seg_timecode:
+        print("\n=== deterministic latency (7-seg decode) ===")
+        dl = deterministic_latency_from_output_frames(
+            out_frames,
+            position=args.timecode_position,
+            seg_len=args.timecode_seg_len,
+            seg_th=args.timecode_seg_th,
+            spacing=args.timecode_spacing,
+            margin=args.timecode_margin,
+        )
+        report["deterministic_latency"] = dl
+        print(json.dumps(dl, indent=2))
+
     report["output_probe_after"] = ffprobe_summary(args.out_url)
 
-    # Write report
     report_path = os.path.join(out_dir, "report.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     print("\n=== ffprobe (output/after) ===")
     print(json.dumps(report["output_probe_after"], indent=2))
-
-    print("\n=== quality summary ===")
-    q = report["quality"]
-    if q and q.get("ok"):
-        m = q["metrics"]
-        print(f"Frames compared:    {q['frames_compared']}")
-        print(f"MAE mean:           {m['mae_mean']:.3f} (p95={m['mae_p95']:.3f})")
-        print(f"PSNR mean:          {m['psnr_gray_mean']:.2f} dB (p05={m['psnr_gray_p05']:.2f} dB)")
-        print(f"Hist dist mean:     {m['hist_bhattacharyya_mean']:.4f}")
-        print(f"Brightness in/out:  {m['in_brightness_mean']:.2f} / {m['out_brightness_mean']:.2f}")
-        print(f"Contrast in/out:    {m['in_contrast_std_mean']:.2f} / {m['out_contrast_std_mean']:.2f}")
-        print(f"Watermark ROI Δ:    {m['watermark_roi_mae_mean']:.3f}")
-        print(f"Latency estimate:   {q.get('latency_estimate_seconds')} seconds (best-effort)")
-    else:
-        print("Quality analysis failed:", (q or {}).get("error"))
-
-    if report.get("broadcaster_test"):
-        b = report["broadcaster_test"]
-        print("\n=== broadcaster summary ===")
-        print(f"Test duration:      {b['duration_s']:.2f}s")
-        print(f"Frames grabbed:     {b['frames_grabbed']}")
-        print(f"Frames pushed:      {b['frames_pushed']}")
-        print(f"Write failures:     {b['write_failures']}")
-        print(f"Pushed FPS:         {b['pushed_fps']:.2f}")
-        print(f"Broadcaster alive:  {b['broadcaster_alive_end']}")
 
     print(f"\nArtifacts written to: {out_dir}")
     print(f"Report: {report_path}")
