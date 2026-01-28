@@ -59,12 +59,19 @@ def _start_ffmpeg_stderr_logger(proc, logger, prefix: str):
     return t
 
 
+def _epoch_ms() -> int:
+    return int(time.time() * 1000)
+
+
 class Ingestor:
     """
     Ingestor: rtmp://domain/app/streamkey -> raw bgr24 frames via stdout pipe.
 
-    IMPORTANT: This ingestor enforces scale to (width,height) so the read size
-    always matches width*height*3.
+    IMPORTANT: Enforces scale to (width,height) so the read size always matches.
+    Optional overlays:
+      - watermark_text: arbitrary
+      - timecode_overlay: machine-parseable stamp for deterministic latency
+        format: "TC|ms=<epoch_ms>|seq=<seq>"
     """
 
     def __init__(
@@ -77,6 +84,12 @@ class Ingestor:
         loglevel="info",
         watermark_text="",
         scale_algo="bilinear",
+        timecode_overlay: bool = False,
+        timecode_position: str = "bl",  # "bl" bottom-left, "tl" top-left
+        timecode_prefix: str = "TC",
+        timecode_font_scale: float = 0.55,
+        timecode_thickness: int = 2,
+        timecode_margin_px: int = 10,
     ):
         self.source = source
         self.streamkey = streamkey
@@ -87,11 +100,16 @@ class Ingestor:
         self.watermark_text = watermark_text
         self.scale_algo = scale_algo
 
+        self.timecode_overlay = bool(timecode_overlay)
+        self.timecode_position = timecode_position
+        self.timecode_prefix = timecode_prefix
+        self.timecode_font_scale = float(timecode_font_scale)
+        self.timecode_thickness = int(timecode_thickness)
+        self.timecode_margin_px = int(timecode_margin_px)
+
         self._address = self.source + self.streamkey
         self.frame_size = self.width * self.height * 3
 
-        # Enforce output size so our frame reads are stable.
-        # Using scale=WxH:flags=... and fps passthrough (no fps filter here).
         vf = f"scale={self.width}:{self.height}:flags={self.scale_algo}"
 
         self._cmdx = [
@@ -136,13 +154,16 @@ class Ingestor:
         self.rfps = 0.0
         self.first_readat = 0.0
 
+        # timecode sequence counter
+        self._seq = 0
+
     def initialize(self):
         self.start_time = time.time()
         ingestor_logger.info("STARTED_AT=%s", str(datetime.datetime.now()))
         self._vpipe = sp.Popen(
             self._cmdx,
-            stdout=sp.PIPE,  # binary rawvideo
-            stderr=sp.PIPE,  # text stderr
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
             bufsize=1,
             text=True,
         )
@@ -164,15 +185,10 @@ class Ingestor:
         return data
 
     def grab(self) -> bool:
-        """
-        Read the next raw frame from ffmpeg stdout into internal buffer.
-        Returns True only when a full frame is read.
-        """
         if self.stopped or self._vpipe is None:
             self._grabbed = False
             return False
 
-        # detect early exit
         if self._vpipe.poll() is not None:
             self._grabbed = False
             return False
@@ -196,10 +212,56 @@ class Ingestor:
         )
         return True
 
+    def _put_text_with_bg(
+        self,
+        img: np.ndarray,
+        text: str,
+        org: Tuple[int, int],
+        font=cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale: float = 0.55,
+        thickness: int = 2,
+        margin: int = 4,
+    ):
+        """
+        Draw text with a solid background rectangle to make OCR much more reliable.
+        """
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x, y = org
+        # background rectangle coordinates
+        x1 = max(0, x - margin)
+        y1 = max(0, y - th - margin)
+        x2 = min(img.shape[1], x + tw + margin)
+        y2 = min(img.shape[0], y + baseline + margin)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 0), -1)  # black bg
+        cv2.putText(img, text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    def _overlay_timecode(self, vframe: np.ndarray):
+        """
+        Overlay parse-friendly timecode.
+        Example: TC|ms=1700000000123|seq=42
+        """
+        self._seq += 1
+        stamp = f"{self.timecode_prefix}|ms={_epoch_ms()}|seq={self._seq}"
+
+        margin = self.timecode_margin_px
+        if self.timecode_position == "tl":
+            # OpenCV text origin is baseline-left; so y must be > text height
+            x = margin
+            y = margin + 20
+        else:
+            # bottom-left
+            x = margin
+            y = self.height - margin
+
+        self._put_text_with_bg(
+            vframe,
+            stamp,
+            (x, y),
+            font_scale=self.timecode_font_scale,
+            thickness=self.timecode_thickness,
+        )
+
     def read(self):
-        """
-        Convert last grabbed raw frame into ndarray (H,W,3) BGR and apply watermark.
-        """
         self.frames_reads += 1
         now = time.time()
 
@@ -211,6 +273,7 @@ class Ingestor:
             (self.height, self.width, 3)
         )
 
+        # watermark (optional)
         if self.watermark_text:
             cv2.putText(
                 vframe,
@@ -222,6 +285,10 @@ class Ingestor:
                 1,
                 cv2.LINE_AA,
             )
+
+        # timecode overlay (optional)
+        if self.timecode_overlay:
+            self._overlay_timecode(vframe)
 
         elapsed_last_read = max(1e-6, now - self.last_frame_readat)
         rps = 1.0 / elapsed_last_read
@@ -368,7 +435,6 @@ class Broadcastor:
             self.address,
         ]
 
-        # counters for analysis / introspection
         self.frames_pushed = 0
         self.write_failures = 0
         self.first_push_at = None
@@ -377,8 +443,8 @@ class Broadcastor:
     def initialize(self):
         self._vpipe = sp.Popen(
             self.cmdx,
-            stdin=sp.PIPE,   # binary stdin
-            stderr=sp.PIPE,  # text stderr
+            stdin=sp.PIPE,
+            stderr=sp.PIPE,
             bufsize=1,
             text=True,
         )
@@ -386,7 +452,6 @@ class Broadcastor:
             self._vpipe, ffmpeg_logger, "[ffmpeg-broadcast]"
         )
 
-        # Prime with a black frame
         sframe = np.zeros((self.height, self.width, 3), np.uint8)
         self.write(sframe)
         return self
@@ -398,7 +463,6 @@ class Broadcastor:
         if self.stopped or self._vpipe is None or self._vpipe.stdin is None:
             self.write_failures += 1
             return False
-
         if frame is None or frame.size == 0:
             self.write_failures += 1
             return False
