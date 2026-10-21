@@ -1,6 +1,6 @@
 # rtmp-opencv-relay
 
-[![License: Proprietary](https://shields.io)]()
+[![License: Proprietary](https://shields.io)](#LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](#requirements)
 
 Headless RTMP video relay:
