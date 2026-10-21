@@ -1,6 +1,5 @@
 # rtmp-opencv-relay
 
-[![License: Proprietary](https://www.nishanthkottapalli.com)](#LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](#requirements)
 
 Headless RTMP video relay:
